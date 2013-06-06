@@ -4,6 +4,7 @@
 # Author:  Michael 'entropie' Trommer <mictro@gmail.com>
 #
 
+require "rubygems"
 require "net/https"
 require "json"
 require "timeout"
@@ -20,14 +21,38 @@ module RushOver
     PUSHOVER_APP_TOKEN  = creds[:pushover_app_token]
 
 
-    class Receipt < Struct.new(:request, :result)
-      RECEIPT_ENDPOINT = "http://api.pushover.net/1/receipts/%s.json?token=#{PUSHOVER_APP_TOKEN}"
+    class Receipt < Struct.new(:request, :watcher)
+
+      RECEIPT_ENDPOINT = "https://api.pushover.net/1/receipts/%s.json?token=#{PUSHOVER_APP_TOKEN}"
+
+      def url
+        URI.parse(RECEIPT_ENDPOINT % request.result["receipt"])
+      end
+
+      def get
+        r = ''
+
+        res = Net::HTTP.new(url.host, url.port)
+        res.use_ssl = true
+        res.verify_mode = OpenSSL::SSL::VERIFY_NONE
+        res.start{|http|
+          r = JSON.parse(http.request( Net::HTTP::Get.new(url.request_uri) ).body)
+        }
+        r
+      end
+
+      def acknowledged?
+        get["acknowledged"] == 1
+      end
     end
 
     def self.receipts
-      @@receipts = []
+      @@receipts ||= []
     end
 
+    def self.receipts_include?(req)
+      not Api.receipts.select{|r| r.watcher == req }.empty?
+    end
 
     ENDPOINT_URL        = URI.parse("http://api.pushover.net/1/messages.json")
 
@@ -68,19 +93,24 @@ module RushOver
         Kernel.puts(">>> Submitting(%s-%s): %s" %
                     [t.strftime("%F"),
                      t.strftime("%T"),
-                     PP.pp(a, '').gsub("\n", "").strip]
+                     message]
+
                     )
       end
     end
 
-    def submit
+    def submit(cls)
+      if Api.receipts_include?(cls)
+        puts "    - not sending message because acknowledgment is pending"
+        return false
+      end
+
       res = Net::HTTP.start(ENDPOINT_URL.host, ENDPOINT_URL.port) {|http|
         http.request(data)
       }
-
       if priority == 2
-        @result = JSON.parse(res.body).map
-        Api.receipts << Receipt.new(self, @result)
+        @result = JSON.parse(res.body)
+        Api.receipts << Receipt.new(self, cls)
       end
     end
   end
@@ -97,11 +127,7 @@ module RushOver
     DEFAULT_PRIORITY = 0
 
     attr_reader :api
-    attr_accessor :title, :message, :timeout, :delay, :priority, :last_state, :expire, :retry, :custom, :sound
-
-    def last_state
-      @last_state
-    end
+    attr_accessor :title, :message, :timeout, :delay, :priority, :expire, :retry, :custom, :sound
 
     def self.watcher
       @watcher ||= []
@@ -131,19 +157,22 @@ module RushOver
       @expire || 3600*24
     end
 
+    def priority
+      @priority || DEFAULT_PRIORITY
+    end
+
     def retry
-      @retry || 30*60
+      @retry || 5*60
     end
 
     def initialize(args)
       args.each do |k, v|
         self.send("#{k}=", v)
       end
-      @last_state = true
     end
 
     def test
-      str = proc { "testing #{title} ... %s" }
+      str = proc { "  > testing #{title} ... %s" }
       state = false
       status = Timeout::timeout(timeout) {
         state = run_test
@@ -154,7 +183,7 @@ module RushOver
       puts str.call % "failed; [#{to_msg}]"
       false
     rescue
-      puts str.call % "!!! failed; [#{$!}]"
+      puts str.call % "!!! failed; [#{$!} #{caller}]"
       false
     else
       puts str.call % "passed; waiting #{delay} seconds"
@@ -170,11 +199,11 @@ module RushOver
       "#{PP.pp(a, '').strip}"
     end
 
-    PUSHOVER_VALID_KEYS = [:priority, :url, :url_title, :expire, :retry, :sound]
+    PUSHOVER_VALID_KEYS = [:priority, :url, :url_title, :expire, :retry, :sound, :priority]
 
     def pushover_hash
       def_hash = { }
-      def_hash.merge!(:retry => self.send(:retry), :expire => expire)
+      def_hash.merge!(:retry => self.send(:retry), :expire => expire, :priority => priority)
       a = self.instance_variables.inject( def_hash ) do |r, iv|
         k = iv[1..-1].to_sym
         if PUSHOVER_VALID_KEYS.include?(k)
@@ -197,12 +226,12 @@ module RushOver
       "[%s]: %s" % [hostname, message]
     end
 
-    def self.send_message(msghsh)
+    def self.send_message(cls, msghsh)
       api = Api.new(msghsh.delete(:title))
       msghsh.each do |k, v|
         api.send("#{k}=", v)
       end
-      api.submit
+      api.submit(cls)
     end
 
     def self.run
@@ -214,16 +243,8 @@ module RushOver
         @runner << Thread.new do
           while true
             hsh = { }
-
             if not s.test
-              if s.last_state
-                send_message(s.pushover_hash.merge(:title => s.title, :message => s.to_msg))
-              else
-                puts "not sending message, already done"
-              end
-              s.last_state = false
-            else
-              s.last_state = true
+              send_message(s, s.pushover_hash.merge(:title => s.title, :message => s.to_msg))
             end
             sleep s.delay
           end
@@ -233,6 +254,30 @@ module RushOver
       puts "", ">>> Running <<<", ""
 
       @runner.each { |r| r.join }
+    end
+  end
+
+  class Receipt < Watcher
+    def receipts
+      Api.receipts
+    end
+
+    def run_test
+      receipts.reject! do |rec|
+        if rec.acknowledged?
+          puts "  > deleting #{rec}"
+          true
+        end
+      end
+      true
+    end
+
+    def message
+      "uh #{$!}"
+    end
+
+    def title
+      "Rcpt(#{receipts.size})"
     end
   end
 
@@ -255,6 +300,7 @@ module RushOver
     end
   end
 
+
   class Custom < Watcher
 
     attr_accessor :maxMem, :maxSwap, :data
@@ -269,7 +315,7 @@ module RushOver
     end
 
     def message
-      "memory value exceeded threshold [#{maxMem}/#{maxSwap} -- %s Mem / %s Swap" % [data[:mem], data[:swap]]
+      "#{@message}"
     end
   end
 
@@ -285,28 +331,31 @@ if __FILE__ == $0
 
   Thread.abort_on_exception = true
 
-  Watcher::add(HTTPWatch, :url => "dogitright.de",  :timeout => 10, :priority => 2, :url_title => "DIR", :timeout => 0.01)
-  #Watcher::add(HTTPWatch, :url => "mogulcloud.com", :timeout => 10, :priority => 2, :url_title => "mogulcloud", :timeout => 1, :sound => :spacealarm)
+  Watcher::add(Receipt, :delay => 50)
+  
+  Watcher::add(HTTPWatch, :url => "dogitright.de",  :timeout => 10, :url_title => "TOFU", :timeout => 5, :priority => 2, :delay => 60, :retry => 60*5)
+  Watcher::add(HTTPWatch, :url => "mogulcloud.com", :timeout => 10, :priority => 2, :url_title => "MC", :timeout => 10, :sound => :spacealarm, :retry => 60*5)
+  Watcher::add(HTTPWatch, :url => "gasthof-albrechtshain.de", :timeout => 10, :priority => 2, :url_title => "MIKE", :timeout => 5, :sound => :spacealarm, :retry => 60*5)
 
   # check memory of host
-  # Watcher::add(Custom,    :maxSwap => 20, :maxMem => 1, :delay => 60, :priority => 2, :title => "Mem", :custom =>
-  #              proc { |c|
-  #                interesting_fields = %w'MemFree MemTotal SwapTotal SwapFree'
-  #                meminfo = Hash[*File.open("/proc/meminfo").readlines.map{|line| line.gsub(/ kB$/, '').split(":").map{|w| w.strip} }.flatten]
-  #                mf, mt = meminfo['MemFree'].to_i, meminfo['MemTotal'].to_i
-  #                sf, st = meminfo['Swapree'].to_i, meminfo['SwapTotal'].to_i
+  Watcher::add(Custom,    :maxSwap => 20, :maxMem => 60, :delay => 60, :priority => 2, :title => "Mem", :custom =>
+               proc { |c|
+                 interesting_fields = %w'MemFree MemTotal SwapTotal SwapFree'
+                 meminfo = Hash[*File.open("/proc/meminfo").readlines.map{|line| line.gsub(/ kB$/, '').split(":").map{|w| w.strip} }.flatten]
+                 mf, mt = meminfo['MemFree'].to_i, meminfo['MemTotal'].to_i
+                 sf, st = meminfo['Swapree'].to_i, meminfo['SwapTotal'].to_i
 
-  #                perc = proc{|a,b| (((a.to_f + 0.01)/(b + 0.01))*100).round }
-  #                c.data[:mem], c.data[:swap] = perc.call(mf,mt), perc.call(sf,st)
+                 perc = proc{|a,b| (((a.to_f + 0.01)/(b + 0.01))*100).round }
+                 c.data[:mem], c.data[:swap] = perc.call(mf,mt), perc.call(sf,st)
 
-  #                if c.data[:mem] > c.maxMem or (c.data[:swap] > c.maxSwap && s < 100)
-  #                  c.message = "Mem: %s%%  Swap: %s%%" % [ c.data[:mem], c.data[:swap] ]
-  #                  false
-  #                else
-  #                  true
-  #                end
-  #              })
-  
+                 if c.data[:mem] > c.maxMem or (c.data[:swap] > c.maxSwap && c.data[:swap] < 100)
+                   c.message = "memory value exceeded threshold [#{c.maxMem}/#{c.maxSwap} -- %s Mem / %s Swap" % [c.data[:mem], c.data[:swap]]
+                   false
+                 else
+                   #c.message = "lala"
+                   true
+                 end
+               })
 
   Watcher.run
   
