@@ -183,7 +183,7 @@ module RushOver
       puts str.call % "failed; [#{to_msg}]"
       false
     rescue
-      puts str.call % "!!! failed; [#{$!} #{caller}]"
+      puts str.call % "!!! failed; [#{$!}]"
       false
     else
       puts str.call % "passed; waiting #{delay} seconds"
@@ -265,7 +265,7 @@ module RushOver
     def run_test
       receipts.reject! do |rec|
         if rec.acknowledged?
-          puts "  > deleting #{rec}"
+          puts "  > #{title}: deleting #{rec.request.url_title}"
           true
         end
       end
@@ -333,9 +333,9 @@ if __FILE__ == $0
 
   Watcher::add(Receipt, :delay => 50)
   
-  Watcher::add(HTTPWatch, :url => "dogitright.de",  :timeout => 10, :url_title => "TOFU", :timeout => 5, :priority => 2, :delay => 60, :retry => 60*5)
+  Watcher::add(HTTPWatch, :url => "dogitright.de",  :timeout => 10, :url_title => "TOFU", :timeout => 5, :priority => 2, :delay => 60, :retry => 60*5, :sound => :siren)
   Watcher::add(HTTPWatch, :url => "mogulcloud.com", :timeout => 10, :priority => 2, :url_title => "MC", :timeout => 10, :sound => :spacealarm, :retry => 60*5)
-  Watcher::add(HTTPWatch, :url => "gasthof-albrechtshain.de", :timeout => 10, :priority => 2, :url_title => "MIKE", :timeout => 5, :sound => :spacealarm, :retry => 60*5)
+  Watcher::add(HTTPWatch, :url => "gasthof-albrechtshain.de", :timeout => 10, :priority => 2, :url_title => "MIKE", :timeout => 5, :retry => 60*5)
 
   # check memory of host
   Watcher::add(Custom,    :maxSwap => 20, :maxMem => 60, :delay => 60, :priority => 2, :title => "Mem", :custom =>
